@@ -1,0 +1,205 @@
+# Load required libraries
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+library(RColorBrewer)
+library(ggforce)
+
+# OLD: Function to read samtools depth file and remove chrM
+read_depth_file <- function(depth_file) {
+  depth_data <- read.table(depth_file, header = FALSE, col.names = c("chromosome", "position", "depth"))
+  depth_data <- depth_data[depth_data$chromosome != "chrM",] 
+  return(depth_data)
+}
+
+# NEW: Function to read samtools depth file, remove chrM, fix Sbay_10, Sbay_12 swap, and nomenclature fix of Sbay to Suva
+read_depth_file <- function(depth_file) {
+  # Read the file
+  depth_data <- read.table(depth_file, header = FALSE, col.names = c("chromosome", "position", "depth"))
+  
+  # Remove chrM
+  depth_data <- depth_data[depth_data$chromosome != "chrM",]
+  
+  # Swap Sbay_10 and Sbay_12 labels using a temporary placeholder
+  depth_data$chromosome <- gsub("Sbay_10", "TEMP_Sbay_10", depth_data$chromosome)
+  depth_data$chromosome <- gsub("Sbay_12", "Sbay_10", depth_data$chromosome)
+  depth_data$chromosome <- gsub("TEMP_Sbay_10", "Sbay_12", depth_data$chromosome)
+  
+  # Rename all Sbay_# to Suva_#
+  depth_data$chromosome <- gsub("^Sbay_", "Suva_", depth_data$chromosome)
+  
+  return(depth_data)
+}
+
+# Function to normalize depth (does not factor in coverage)
+normalize_depth <- function(depth_data, expected_ploidy) {
+  depth_data$normalized_depth <- depth_data$depth / (mean(depth_data$depth) * expected_ploidy)
+  return(depth_data)
+}
+
+##In this case I have changed it to 3000 bp for smoothing of low coverage sequencing
+bin_3000bp <- function(depth_data) {
+  depth_data$bin <- ceiling(depth_data$position / 3000)
+  return(depth_data)
+}
+
+# Function to calculate average normalized_depth per kb bin
+kb_bin_averages <- function(depth_data) {
+  binned_data <- depth_data %>%
+    group_by(chromosome, bin) %>%
+    summarise(kb_average_depth = mean(normalized_depth))
+  return(binned_data)
+}
+
+# Function to trim ends of chromosomes to avoid noise 
+trim_ends <- function(binned_data, trim_percent = 0.05) {
+  n <- nrow(binned_data)
+  trim_start <- floor(trim_percent * n)
+  trim_end <- ceiling((1 - trim_percent) * n)
+  binned_data <- binned_data[(trim_start + 1):(trim_end - 1), ]
+  return(binned_data)
+}
+
+#SKIP NEXT PART if don't want rolling med for individual chr
+# Function to calculate the rolling median to also plot
+med_line <- function(binned_data) {
+  binned_data$rolling_med <- runmed(binned_data$kb_average_depth, k=171, endrule = "median")
+  return(binned_data)
+}
+
+# Applying med_line function to calculate the rolling median grouping by chromosome
+roll_med_chr <- function(binned_data) {
+  binned_data <- binned_data %>%
+    group_by(chromosome) %>%
+    do(trim_ends(.)) %>%
+    do(med_line(.)) %>%
+    ungroup()
+  return(binned_data)
+}
+
+# Function to get chromosome sizes
+##Only need to do this the one time to generate chr_sizes
+get_chromosome_sizes <- function(depth_data) {
+  chr_sizes <- depth_data %>%
+    group_by(chromosome) %>%
+    summarise(size = max(position)) %>%
+    ungroup()
+  return(chr_sizes)
+}
+
+# Assuming chr_lengths is a named vector containing the lengths of each chromosome in base pairs
+chr_lengths <- c(chrI = 230218, Suva_1 = 189981, chrII = 813184, Suva_2 = 1289935, chrIII = 316620, Suva_3 = 295075,
+                 chrIV = 1531933, Suva_4 = 983774, chrV = 576874, Suva_5 = 531350, chrVI = 270161, Suva_6 = 523204,
+                 chrVII = 1090940, Suva_7 = 1027508, chrVIII = 562643, Suva_8 = 806278, chrIX = 439888, Suva_9 = 418340,
+                 chrX = 745751, Suva_10 = 445542, chrXI = 666816, Suva_11 = 635711, chrXII = 1078177, Suva_12 = 1016005, 
+                 chrXIII = 924431, Suva_13 = 907341, chrXIV = 784333, Suva_14 = 750656, chrXV = 1091291, Suva_15 = 763749,
+                 chrXVI = 948066, Suva_16 = 918464)
+
+##Scripts to set colors and determine order of plotting
+# Create a color palette with 32 distinct colors
+colors <- colorRampPalette(brewer.pal(12, "Paired"))(32)
+
+# Create a named vector for chromosome colors
+chr_colors <- setNames(colors, names(chr_lengths))
+
+##Can manually reassign colors with this too:
+##Altered color palette with color/chromosome, light = cer, dark = uva
+chr_colors <- c(
+  chrI = "#A6CEE3", Suva_1 = "#287EB1", chrII = "#FFCC66", Suva_2 = "#F98314", chrIII = "#A1D67D", 
+  Suva_3 = "#47AA3B", chrIV = "#BA9FCC", Suva_4 = "#764CA1", chrV = "#E79A8E", Suva_5 = "#E31E20", 
+  chrVI = "#E8CE78", Suva_6 = "#CC9933" , chrVII =  "#99CCFF", Suva_7 = "#287EB1", chrVIII = "#FFCC99", 
+  Suva_8 = "#F98314", chrIX = "#99CC66", Suva_9 = "#336600", chrX = "#CC99FF" , Suva_10 = "#660099", 
+  chrXI = "#FF9999", Suva_11 = "#990033", chrXII = "#FFCC00", Suva_12 = "#CC9900", chrXIII = "#99CCCC", 
+  Suva_13 = "#00CCCC", chrXIV = "#FFCC99" , Suva_14 = "#CC9350", chrXV = "#66CC66" , Suva_15 = "#336600", 
+  chrXVI = "#CCCCFF", Suva_16 = "#8B6899"
+)
+
+# Function to add genome-wide position with 3kb bins
+add_genome_position_3kb <- function(binned_data, chr_lengths) {
+  chr_cumsum <- c(0, cumsum(chr_lengths))
+  names(chr_cumsum) <- names(chr_lengths)
+  binned_data <- binned_data %>%
+    mutate(genome_position = bin * 3000 + chr_cumsum[chromosome])
+  return(binned_data)
+}
+
+# Function to plot copy number for the entire genome with mini y-axes for each sample
+plot_copy_number_genome <- function(binned_data, chr_colors) {
+  ggplot(binned_data, aes(x = genome_position, y = kb_average_depth, color = chromosome)) +
+    geom_point(alpha = 0.7) +
+    labs(x = "Genome Position (bp)", y = "Copy Number", title = "Copy Number Variation Along the Genome") +
+    scale_color_manual(values = chr_colors) +
+    facet_wrap(~sample, scales = "free_y", ncol = 1, strip.position = "right") +
+    ylim(0, 2) +
+    theme(
+      axis.text.x = element_text(angle = 0, vjust = 0.5, hjust = 1)
+    )
+}
+
+# Provide file path to samtools depth .txt output files for both samples
+depth_file1 <- "Work/Analysis/clb2/final_depth_files/YTW125_c3_trim_noMM_R1R2_MD_depth.txt"
+depth_file2 <- "Work/Analysis/clb2/final_depth_files/YTW164_c13_trim_noMM_R1R2_MD_depth.txt"
+depth_file3 <- "Work/Analysis/clb2/final_depth_files/YTW165_c5_trim_noMM_R1R2_MD_depth.txt"
+depth_file4 <- "Work/Analysis/clb2/final_depth_files/YTW165_c10_trim_noMM_R1R2_MD_depth.txt"
+
+#Specify the expected ploidy for your plotting
+expected_ploidy <- 2
+
+#Read the .txt files into a data frame in R
+depth_data1 <- read_depth_file(depth_file1)
+depth_data2 <- read_depth_file(depth_file2)
+depth_data3 <- read_depth_file(depth_file3)
+depth_data4 <- read_depth_file(depth_file4)
+
+# Normalize depth data
+depth_data1 <- normalize_depth(depth_data1, expected_ploidy)
+depth_data2 <- normalize_depth(depth_data2, expected_ploidy)
+depth_data3 <- normalize_depth(depth_data3, expected_ploidy)
+depth_data4 <- normalize_depth(depth_data4, expected_ploidy)
+
+#Binning by 3kb is a good intermediate option as well
+depth_data1 <- bin_3000bp(depth_data1)
+depth_data2 <- bin_3000bp(depth_data2)
+depth_data3 <- bin_3000bp(depth_data3)
+depth_data4 <- bin_3000bp(depth_data4)
+
+# Calculate average normalized depth per 3 kb bin
+binned_data1 <- kb_bin_averages(depth_data1)
+binned_data2 <- kb_bin_averages(depth_data2)
+binned_data3 <- kb_bin_averages(depth_data3)
+binned_data4 <- kb_bin_averages(depth_data4)
+
+# Calculate the rolling median
+binned_data1 <- roll_med_chr(binned_data1)
+binned_data2 <- roll_med_chr(binned_data2)
+
+# Retrieve the chromosome sizes for plotting (Need correct lengths)
+##Only need to do this once to create data frame chr_lengths
+chr_sizes <- get_chromosome_sizes(depth_data1)
+
+#Set chromosome plot order with order of chr in chr_lengths
+binned_data1$chromosome <- factor(binned_data1$chromosome, levels = names(chr_lengths))
+binned_data2$chromosome <- factor(binned_data2$chromosome, levels = names(chr_lengths))
+binned_data3$chromosome <- factor(binned_data3$chromosome, levels = names(chr_lengths))
+binned_data4$chromosome <- factor(binned_data4$chromosome, levels = names(chr_lengths))
+
+# Add genome-wide position with 3kb bins
+binned_data1 <- add_genome_position_3kb(binned_data1, chr_lengths)
+binned_data2 <- add_genome_position_3kb(binned_data2, chr_lengths)
+binned_data3 <- add_genome_position_3kb(binned_data3, chr_lengths)
+binned_data4 <- add_genome_position_3kb(binned_data4, chr_lengths)
+
+# Add sample labels
+binned_data1$sample <- "YTW125 c3"
+binned_data2$sample <- "YTW164 c13"
+binned_data3$sample <- "YTW165 c5"
+binned_data4$sample <- "YTW165 c10"
+
+# Combine both samples into one data frame
+combined_binned_data <- bind_rows(binned_data1, binned_data2, binned_data3, binned_data4)
+
+# Combine both samples into one data frame for two plots
+combined_binned_data <- bind_rows(binned_data1, binned_data2)
+
+# Plot the combined data with each sample on it's own line
+plot_copy_number_genome(combined_binned_data, chr_colors)
